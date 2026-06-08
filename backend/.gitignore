@@ -1,0 +1,21 @@
+# Entornos virtuales
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Variables de entorno secretas (NUNCA SUBIR EL .env AL REPOSITORIO)
+.env
+
+# Archivos de caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Base de datos local SQLite
+*.db
+*.sqlite3
+
+# Archivos del sistema
+.DS_Store

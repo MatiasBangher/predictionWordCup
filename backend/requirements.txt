@@ -1,0 +1,12 @@
+fastapi[all]
+uvicorn
+sqlalchemy
+psycopg2-binary
+redis
+httpx
+pandas
+scikit-learn
+apscheduler
+beautifulsoup4
+pydantic
+python-dotenv
