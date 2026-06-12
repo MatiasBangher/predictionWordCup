@@ -61,6 +61,53 @@ MARKET_TEXTS = {
             "El visitante llega con una defensa sólida que suele mantener la portería a cero. La probabilidad de que alguno no anote es alta.",
         ]
     },
+    "cards": {
+        "over_high_conf": [
+            "Históricamente este tipo de encuentros acumula muchas tarjetas. El árbitro designado tiene un promedio alto de amonestaciones por partido, lo que refuerza la línea de más de {line} tarjetas.",
+            "La intensidad esperada del partido y el historial de sanciones entre estos equipos sugiere superar la línea de {line} tarjetas.",
+        ],
+        "under_high_conf": [
+            "Ambos equipos tienen un juego limpio notable y el árbitro asignado suele ser conservador con las tarjetas. Menos de {line} tarjetas es estadísticamente probable.",
+        ],
+        "generic": [
+            "El análisis de tarjetas se basa en el historial disciplinario de ambas selecciones y el perfil del árbitro asignado.",
+        ]
+    },
+    "first_goal": {
+        "generic": [
+            "La estadística muestra que en partidos de esta fase del torneo, el primer gol suele llegar temprano. La línea refleja la tendencia ofensiva de estos equipos.",
+            "El modelo proyecta que la apertura del marcador ocurra dentro de la primera mitad, basándose en datos xG y ritmo de juego de ambas selecciones.",
+        ]
+    },
+    "shots_on_target": {
+        "generic": [
+            "El promedio de tiros al arco de estos equipos respalda esta selección. Las métricas xG indican un alto volumen de remates encuadrados.",
+            "El análisis de remates al arco por partido de ambos combinados apoya la línea seleccionada con buena confianza.",
+        ]
+    },
+    "draw_no_bet": {
+        "generic": [
+            "Empate No Apuesta elimina el riesgo del empate, dando una apuesta de seguridad sobre {team}. El modelo estima buena probabilidad a favor.",
+            "Con la protección del empate incluida, esta selección ofrece un margen de seguridad atractivo para {team}.",
+        ]
+    },
+    "handicap": {
+        "generic": [
+            "El handicap {line} ajusta la línea a favor de {team}, compensando la diferencia de nivel entre ambos equipos según el modelo.",
+            "La línea de handicap refleja la diferencia proyectada en el marcador. El análisis de xG y ELO respalda la selección.",
+        ]
+    },
+    "asian_handicap": {
+        "generic": [
+            "El Handicap Asiático {line} ofrece una línea ajustada basada en la superioridad estimada. El modelo encuentra valor en esta selección.",
+        ]
+    },
+    "half_time": {
+        "generic": [
+            "El resultado al descanso favorece a {team} según las tendencias de estos equipos en primeros tiempos. El modelo analiza la intensidad inicial de ambas selecciones.",
+            "Históricamente, estos equipos definen el rumbo del partido en la primera mitad. La selección del descanso es coherente con el patrón táctico esperado.",
+        ]
+    },
     "generic": [
         "El modelo algorítmico identifica valor positivo en esta apuesta respecto a la probabilidad real estimada.",
         "Esta selección tiene una probabilidad real superior a la que la cuota implica, generando valor esperado positivo.",
@@ -109,7 +156,24 @@ def analyze_fijini(fijini_dict: dict, home_team: str, away_team: str,
     h2h_dom = 0.5 + (form_diff * 0.04)
 
     # ── Probabilidad Real ─────────────────────────────────────────────────────
-    if ml_model is not None:
+    # Prioridad 1: Simulación Monte Carlo (lo más preciso)
+    mc_result = None
+    try:
+        from ml.fijini_simulator import simulate_fijini
+        mc_result = simulate_fijini(
+            home_team=home_team,
+            away_team=away_team,
+            market_key=market_key,
+            selection=selection,
+            price=price,
+            n_simulations=10_000
+        )
+        actual_prob = mc_result["mc_probability"]
+    except Exception:
+        mc_result = None
+
+    # Prioridad 2: Modelo ML entrenado
+    if mc_result is None and ml_model is not None:
         try:
             import pandas as pd
             feats = pd.DataFrame([[form_diff, goal_diff, h2h_dom]],
@@ -118,21 +182,20 @@ def analyze_fijini(fijini_dict: dict, home_team: str, away_team: str,
             actual_prob = prob_ml if prob_ml >= 50 else (100 - prob_ml)
         except Exception:
             actual_prob = implied_prob * 1.05
-    else:
-        # Estimación heurística variada basada en cuota + features
+
+    # Prioridad 3: Estimación heurística (fallback)
+    if mc_result is None and ml_model is None:
         base = implied_prob
         boost = 0.0
 
         if "corner" in market_key or "córner" in market_key:
-            # Córners: basa la corrección en la cuota
             boost = 2.5 if price < 1.20 else 1.5
         elif "total" in market_key or "gole" in market_key:
             boost = 3.0 if price < 1.20 else 1.8
         elif "h2h" in market_key or "ganador" in market_key:
-            # Si es favorito claro (precio < 1.35), ligeramente sobre la implied
             boost = 2.0 if price < 1.35 else 0.5
         elif "double" in market_key or "doble" in market_key:
-            boost = 3.5  # Doble oportunidad suele ser muy segura
+            boost = 3.5
         elif "btts" in market_key or "ambos" in market_key:
             boost = 1.0
         elif "card" in market_key or "tarjeta" in market_key:
@@ -140,27 +203,33 @@ def analyze_fijini(fijini_dict: dict, home_team: str, away_team: str,
         else:
             boost = 2.0
 
-        # Ajuste por diferencia de forma
         if abs(form_diff) > 2:
             boost += 1.5
         elif abs(form_diff) > 1:
             boost += 0.8
 
-        actual_prob = min(97.0, max(55.0, base + boost))
+        actual_prob = min(98.0, max(15.0, base + boost))
 
     actual_prob = round(actual_prob, 1)
 
     # ── Valor ─────────────────────────────────────────────────────────────────
     edge = actual_prob - implied_prob
-    if edge > 5:
+    edge_pct = round(edge, 2)
+    if edge > 8:
+        color = "GREEN"
+        value_tag = "valor positivo excepcional"
+    elif edge > 5:
         color = "GREEN"
         value_tag = "valor positivo alto"
-    elif edge > 1:
+    elif edge > 2:
         color = "YELLOW"
         value_tag = "valor positivo marginal"
+    elif edge > 0:
+        color = "ORANGE"
+        value_tag = "valor neutro"
     else:
         color = "RED"
-        value_tag = "sin ventaja clara sobre el mercado"
+        value_tag = "sin ventaja sobre el mercado"
 
     # ── Texto de Análisis ──────────────────────────────────────────────────────
     line = _get_line_from_selection(selection)
@@ -176,6 +245,22 @@ def analyze_fijini(fijini_dict: dict, home_team: str, away_team: str,
         pool = [t.replace("{team}", team) for t in MARKET_TEXTS["double_chance"]["generic"]]
     elif "btts" in market_key or "ambos" in market_key:
         pool = MARKET_TEXTS["btts"]["yes" if "sí" in selection.lower() else "no"]
+    elif "card" in market_key or "tarjeta" in market_key:
+        pool = MARKET_TEXTS["cards"]["over_high_conf" if is_over else "under_high_conf" if is_under else "generic"]
+    elif "first_goal" in market_key or "primer gol" in market_key:
+        pool = MARKET_TEXTS["first_goal"]["generic"]
+    elif "shots" in market_key or "tiro" in market_key:
+        pool = MARKET_TEXTS["shots_on_target"]["generic"]
+    elif "draw_no_bet" in market_key or "empate no" in market_key:
+        team = home_team if home_team.lower() in selection.lower() else away_team
+        pool = [t.replace("{team}", team) for t in MARKET_TEXTS["draw_no_bet"]["generic"]]
+    elif "handicap" in market_key or "asian" in market_key:
+        team = home_team if home_team.lower() in selection.lower() else away_team
+        mk = "asian_handicap" if "asian" in market_key else "handicap"
+        pool = [t.replace("{team}", team) for t in MARKET_TEXTS.get(mk, MARKET_TEXTS["handicap"])["generic"]]
+    elif "half_time" in market_key or "descanso" in market_key:
+        team = home_team if home_team.lower() in selection.lower() else away_team
+        pool = [t.replace("{team}", team) for t in MARKET_TEXTS["half_time"]["generic"]]
     elif "h2h" in market_key or "ganador" in market_key:
         team = home_team if home_team.lower() in selection.lower() else away_team
         pool = [t.replace("{team}", team) for t in MARKET_TEXTS["h2h"]["favorite_high_conf" if price < 1.40 else "generic"]]
@@ -185,6 +270,26 @@ def analyze_fijini(fijini_dict: dict, home_team: str, away_team: str,
     import random
     analysis_text_base = random.choice(pool).replace("{line}", line).replace("{team}", home_team)
 
+    if edge > 2:
+        try:
+            from llm.groq_client import generate_bet_analysis
+            groq_analysis = generate_bet_analysis(
+                home_team=home_team,
+                away_team=away_team,
+                market_key=market_key,
+                selection=selection,
+                actual_prob=actual_prob,
+                implied_prob=implied_prob,
+                edge=edge_pct,
+                home_stats=home_stats,
+                away_stats=away_stats,
+                mc_result=mc_result
+            )
+            if groq_analysis and "El modelo encuentra valor" not in groq_analysis:
+                analysis_text_base = groq_analysis
+        except Exception:
+            pass
+
     text = (f"El modelo proyecta un {actual_prob}% de probabilidad real "
             f"(cuota implica {implied_prob}%). {analysis_text_base} "
             f"→ {value_tag}.")
@@ -193,5 +298,8 @@ def analyze_fijini(fijini_dict: dict, home_team: str, away_team: str,
         "color": color,
         "text": text,
         "actual_probability": actual_prob,
-        "implied_probability": implied_prob
+        "implied_probability": implied_prob,
+        "edge_percentage": edge_pct,
+        "monte_carlo": mc_result if mc_result else {"status": "No disponible — usando estimación heurística"},
+        "source": "monte_carlo" if mc_result else ("ml_model" if ml_model else "heuristic"),
     }

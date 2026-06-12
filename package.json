@@ -1,0 +1,13 @@
+{
+  "name": "predictionwordcup-root",
+  "version": "1.0.0",
+  "description": "Start both frontend and backend concurrently",
+  "scripts": {
+    "dev:backend": "cd backend && uvicorn main:app --reload --port 8000",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.0.0"
+  }
+}

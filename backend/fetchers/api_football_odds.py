@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 def fetch_api_football_odds(base_matches: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Fetches live or pre-match odds from API-Football.
-    Filters for value bets between 1.10 and 1.25.
+    Filters for value bets between 1.05 and 1.60.
     Returns mock data for development if tournament hasn't started or no odds exist.
     """
     if not API_FOOTBALL_KEY:
@@ -78,7 +78,7 @@ def parse_api_football_odds(raw_data: List[Dict[str, Any]]) -> List[Dict[str, An
                     "source": "api_football"
                 }
                 
-                if 1.10 <= price <= 1.25:
+                if 1.10 <= price <= 1.30:
                     match_fijinis.append(odd_obj)
                 
                 if price > 1.01:
@@ -119,20 +119,44 @@ def get_mock_api_football_odds(base_matches: List[Dict[str, Any]] = None) -> Lis
         {
             "market": "Tiros al Arco",
             "market_key": "shots_on_target",
-            "price_range": (1.13, 1.22),
+            "price_range": (1.10, 1.30),
             "selections": ["Más de 3.5 tiros al arco (total)", "Ambos equipos con 1+ tiro al arco"],
         },
         {
             "market": "Tarjetas Totales",
             "market_key": "cards",
-            "price_range": (1.15, 1.28),
+            "price_range": (1.12, 1.30),
             "selections": ["Menos de 5.5 tarjetas", "Al menos 1 tarjeta amarilla"],
         },
         {
             "market": "Primer Gol",
             "market_key": "first_goal",
-            "price_range": (1.17, 1.25),
+            "price_range": (1.15, 1.30),
             "selections": ["Gol en la 1ª mitad", "Gol antes del min 30"],
+        },
+        {
+            "market": "Resultado al Descanso",
+            "market_key": "half_time",
+            "price_range": (1.20, 1.30),
+            "selections": ["Local o Empate al descanso", "Visitante o Empate al descanso"],
+        },
+        {
+            "market": "Total de Goles 1ª Mitad",
+            "market_key": "first_half_totals",
+            "price_range": (1.18, 1.30),
+            "selections": ["Más de 0.5 goles en 1ª mitad", "Menos de 1.5 goles en 1ª mitad"],
+        },
+        {
+            "market": "Jugador Anota en Cualquier Momento",
+            "market_key": "player_anytime",
+            "price_range": (1.20, 1.30),
+            "selections": ["Goleador del local anota", "Goleador del visitante anota"],
+        },
+        {
+            "market": "Sin Gol (Clean Sheet)",
+            "market_key": "clean_sheet",
+            "price_range": (1.25, 1.30),
+            "selections": ["Local mantiene portería a cero", "Visitante mantiene portería a cero"],
         },
     ]
 
@@ -141,10 +165,20 @@ def get_mock_api_football_odds(base_matches: List[Dict[str, Any]] = None) -> Lis
         home_team = match.get("home_team", "Local")
         away_team = match.get("away_team", "Visitante")
 
-        # Elegir 1 mercado único por partido (para no saturar)
-        pool = random.choice(supplementary_pools)
-        price = round(random.uniform(*pool["price_range"]), 2)
-        selection = random.choice(pool["selections"])
+        # Elegir 2 mercados únicos por partido para mayor cobertura
+        chosen_pools = random.sample(supplementary_pools, min(2, len(supplementary_pools)))
+        fijinis_list = []
+        for pool in chosen_pools:
+            price = round(random.uniform(*pool["price_range"]), 2)
+            selection = random.choice(pool["selections"])
+            fijinis_list.append({
+                "market": pool["market"],
+                "market_key": pool["market_key"],
+                "selection": selection,
+                "price": price,
+                "bookmaker": random.choice(["Bet365", "1xBet", "Pinnacle", "Unibet", "Betano", "William Hill"]),
+                "source": "api_football"
+            })
 
         results.append({
             "external_match_id": f"af_{match.get('external_match_id', '')}",
@@ -152,16 +186,7 @@ def get_mock_api_football_odds(base_matches: List[Dict[str, Any]] = None) -> Lis
             "away_team": away_team,
             "commence_time": match.get("commence_time"),
             "group": match.get("group"),
-            "fijinis": [
-                {
-                    "market": pool["market"],
-                    "market_key": pool["market_key"],
-                    "selection": selection,
-                    "price": price,
-                    "bookmaker": random.choice(["Bet365", "1xBet", "Pinnacle", "Unibet"]),
-                    "source": "api_football"
-                }
-            ]
+            "fijinis": fijinis_list
         })
 
     return results

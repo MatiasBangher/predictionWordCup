@@ -68,7 +68,7 @@ export default function Dashboard() {
       <div className="glass-panel p-6">
         <h3 className="text-lg font-semibold text-slate-200 mb-6">Evolución del Bankroll</h3>
         <div className="h-80 w-full">
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer width="100%" height={320}>
             <AreaChart data={data.history}>
               <defs>
                 <linearGradient id="colorBalance" x1="0" y1="0" x2="0" y2="1">

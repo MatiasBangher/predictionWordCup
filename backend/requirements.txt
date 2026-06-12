@@ -10,3 +10,8 @@ apscheduler
 beautifulsoup4
 pydantic
 python-dotenv
+xgboost
+numpy
+joblib
+lxml
+groq

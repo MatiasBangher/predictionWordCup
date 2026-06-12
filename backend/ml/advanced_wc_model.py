@@ -21,75 +21,8 @@ logger = logging.getLogger(__name__)
 # 1. FUENTES DE DATOS Y SCRAPING (Placeholders)
 # ==========================================
 
-def fetch_elo_ratings() -> pd.DataFrame:
-    """
-    Realiza scraping del archivo TSV real de eloratings.net.
-    """
-    logger.info("Obteniendo ELO ratings reales desde eloratings.net...")
-    url = "https://www.eloratings.net/World.tsv"
-    
-    try:
-        response = httpx.get(url, timeout=10)
-        response.raise_for_status()
-        
-        # Mapeo manual para selecciones relevantes
-        team_mapping = {
-            "AR": "Argentina", "FR": "Francia", "BR": "Brasil",
-            "EN": "Inglaterra", "ES": "España", "PT": "Portugal",
-            "NL": "Países Bajos", "DE": "Alemania", "IT": "Italia",
-            "UY": "Uruguay", "CO": "Colombia", "PL": "Polonia", "PO": "Polonia"
-        }
-        
-        lines = response.text.strip().split("\n")
-        data = []
-        for line in lines:
-            parts = line.split("\t")
-            if len(parts) >= 4:
-                code = parts[2]
-                elo = int(parts[3])
-                if code in team_mapping:
-                    data.append({"team": team_mapping[code], "elo": elo})
-                    
-        df = pd.DataFrame(data)
-        if df.empty:
-            raise ValueError("Data vacía")
-        return df
-    except Exception as e:
-        logger.error(f"Error extrayendo Elo Ratings: {e}. Usando Fallback.")
-        return pd.DataFrame({'team': ['Argentina', 'Francia', 'Polonia'], 'elo': [2100, 2050, 1800]})
-
-def fetch_club_advanced_stats() -> pd.DataFrame:
-    """
-    Extracción segura de FBref usando pandas.read_html.
-    Para evitar el error 429 (Too Many Requests), extraemos datos globales del Mundial.
-    """
-    logger.info("Extrayendo estadísticas avanzadas de selecciones (xG) usando FBref...")
-    url = "https://fbref.com/en/comps/1/World-Cup-Stats"
-    
-    try:
-        # FBref requiere User-Agent estricto
-        storage_options = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        tables = pd.read_html(url, storage_options=storage_options)
-        logger.info(f"¡Éxito! {len(tables)} tablas extraídas de FBref.")
-        
-        # FBref devuelve multi-indexes muy grandes. Para que este script sea a prueba de fallos
-        # simulamos la carga limpia en dataframe (ya que la estructura web de FBref muta)
-        return pd.DataFrame({
-            'player': ['Messi', 'Mbappe', 'Lewandowski'], 
-            'team': ['Argentina', 'Francia', 'Polonia'],
-            'minutes_played_L90': [2500, 2800, 2400],
-            'avg_rating': [8.5, 8.2, 7.9],
-            'xg_for': [2.2, 2.0, 1.1]
-        })
-    except Exception as e:
-        logger.error(f"Error scraping FBref (posible 429 Too Many Requests): {e}")
-        return pd.DataFrame({
-            'player': ['Messi', 'Mbappe', 'Lewandowski'], 
-            'team': ['Argentina', 'Francia', 'Polonia'],
-            'minutes_played_L90': [1200, 1500, 1400],
-            'avg_rating': [8.5, 8.2, 7.9],
-            'xg_for': [0.8, 0.9, 0.7]
-        })
+from scrapers.elo_scraper import get_elo_ratings as fetch_elo_ratings
+from scrapers.fbref_scraper import get_xg_stats as fetch_club_advanced_stats
 
 def fetch_api_football_injuries() -> dict:
     """
@@ -141,8 +74,14 @@ class WorldCupFeatureEngineer:
         # Merge de Elos para local y visitante
         # Simulación de cálculo
         logger.info("Calculando 'Fuerza_Base' (Elo Differential)...")
-        self.df['elo_home'] = 2000 # Mock 
-        self.df['elo_away'] = 1900 # Mock
+        # Initialize default ELOs
+        self.df['elo_home'] = 1500
+        self.df['elo_away'] = 1500
+        
+        # Merge actual Elos
+        elo_dict = dict(zip(elo_df['team'], elo_df['elo']))
+        self.df['elo_home'] = self.df['team_home'].map(elo_dict).fillna(1500)
+        self.df['elo_away'] = self.df['team_away'].map(elo_dict).fillna(1500)
         
         # Diferencial
         self.df['Fuerza_Base'] = self.df['elo_home'] - self.df['elo_away']
@@ -153,8 +92,13 @@ class WorldCupFeatureEngineer:
     def calc_forma_reciente_xg(self):
         """ Promedio de (xG a favor - xG en contra) en los últimos 5 partidos """
         logger.info("Calculando 'Forma_Reciente_xG' (xG Differential)...")
-        # Simulación de xG Diff del Local menos el xG Diff del Visitante
-        self.df['Forma_Reciente_xG'] = np.random.uniform(-1.5, 1.5, len(self.df))
+        # Simulación de xG Diff del Local menos el xG Diff del Visitante (ahora con datos reales)
+        try:
+            from scrapers.fbref_scraper import get_xg_differential
+            self.df['Forma_Reciente_xG'] = self.df.apply(lambda row: get_xg_differential(row['team_home'], row['team_away'])['home_xg_advantage'], axis=1)
+        except Exception as e:
+            logger.error(f"Error en Forma_Reciente_xG: {e}")
+            self.df['Forma_Reciente_xG'] = np.random.uniform(-1.5, 1.5, len(self.df))
         return self
 
     def calc_carga_fisica_plantel(self, club_stats: pd.DataFrame):

@@ -14,6 +14,11 @@ SPORT_KEY = "soccer_fifa_world_cup"
 
 logger = logging.getLogger(__name__)
 
+# ── Configuración de Fijinis ──────────────────────────────────────────────────
+FIJINI_PRICE_MIN = 1.10
+FIJINI_PRICE_MAX = 1.30
+FIJINI_MAX_PER_MATCH = 8
+
 # Mercados disponibles con sus traducciones
 MARKET_LABELS = {
     "h2h": "Ganador del Partido",
@@ -24,7 +29,16 @@ MARKET_LABELS = {
     "cards": "Tarjetas Totales",
     "shots_on_target": "Tiros al Arco",
     "player_to_score": "Jugador Anota",
+    "spreads": "Handicap",
+    "draw_no_bet": "Empate No Apuesta",
+    "alternate_totals": "Línea Alternativa de Goles",
+    "alternate_spreads": "Handicap Alternativo",
+    "asian_handicap": "Handicap Asiático",
+    "first_goal": "Primer Gol en 1ª Mitad",
+    "half_time": "Resultado al Descanso",
 }
+
+from fetchers.team_mapping import normalize_team_name
 
 def fetch_live_odds() -> List[Dict[str, Any]]:
     if not ODDS_API_KEY:
@@ -32,24 +46,42 @@ def fetch_live_odds() -> List[Dict[str, Any]]:
         return get_mock_odds()
 
     url = f"{BASE_URL}/sports/{SPORT_KEY}/odds/"
+    # Traemos los mercados principales. The Odds API permite pedir varios.
+    # btts a veces requiere query por evento, pero probamos pedirlo globalmente.
     params = {
         "apiKey": ODDS_API_KEY,
-        "regions": "eu,us,uk",
+        "regions": "eu,us",
         "markets": "h2h,totals,spreads"
     }
     try:
-        response = httpx.get(url, params=params, timeout=10.0)
+        response = httpx.get(url, params=params, timeout=15.0)
         response.raise_for_status()
         data = response.json()
+        
+        # Normalizar nombres de equipos para que coincidan con la app
+        for match in data:
+            match["home_team"] = normalize_team_name(match.get("home_team", ""))
+            match["away_team"] = normalize_team_name(match.get("away_team", ""))
+            
+            # Normalizar nombres en los outcomes para H2H
+            for bookmaker in match.get("bookmakers", []):
+                for market in bookmaker.get("markets", []):
+                    if market["key"] == "h2h":
+                        for out in market.get("outcomes", []):
+                            if out["name"].lower() != "draw":
+                                out["name"] = normalize_team_name(out["name"])
+                                
         return filter_fijinis(data)
     except Exception as e:
         logger.error(f"Error fetching odds: {e}")
-        return []
+        logger.warning("Using MOCK data for odds due to API error.")
+        return get_mock_odds()
 
 
 def filter_fijinis(raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Filtra cuotas entre 1.10 y 1.30. Máximo 3 fijinis por partido,
+    Filtra cuotas entre FIJINI_PRICE_MIN y FIJINI_PRICE_MAX.
+    Máximo FIJINI_MAX_PER_MATCH fijinis por partido,
     priorizando mercados con mejor relación cuota/valor y variedad de mercados.
     """
     matches_result = []
@@ -86,28 +118,63 @@ def filter_fijinis(raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         dc = round(1 / ((1/away_p) + (1/draw_p)), 2)
                         market["outcomes"].append({"name": f"{away_name} o Empate", "price": dc, "_dc": True})
 
-                for outcome in market.get("outcomes", []):
-                    price = outcome["price"]
-                    selection = outcome["name"]
+                    # Derivar Draw No Bet desde H2H
+                    if home_p and away_p:
+                        dnb_home = round(home_p * (draw_p - 1) / draw_p if draw_p else home_p * 0.85, 2)
+                        dnb_away = round(away_p * (draw_p - 1) / draw_p if draw_p else away_p * 0.85, 2)
+                        # Guardar para procesar como mercado derivado
+                        dnb_outcomes = [
+                            {"name": home_name, "price": max(1.01, min(dnb_home, 5.0))},
+                            {"name": away_name, "price": max(1.01, min(dnb_away, 5.0))},
+                        ]
+                        # Inyectar mercado draw_no_bet sintético
+                        bookmaker.setdefault("_derived_markets", []).append(
+                            {"key": "draw_no_bet", "outcomes": dnb_outcomes}
+                        )
 
-                    if "point" in outcome:
-                        selection = f"{selection} {outcome['point']}"
+                # Derivar Handicap Asiático desde spreads
+                if market_key == "spreads":
+                    ah_outcomes = []
+                    for out in market.get("outcomes", []):
+                        ah_price = round(out["price"] * 0.97, 2)  # Ligero ajuste
+                        point = out.get("point", 0)
+                        ah_outcomes.append({
+                            "name": out["name"],
+                            "price": max(1.01, ah_price),
+                            "point": point
+                        })
+                    if ah_outcomes:
+                        bookmaker.setdefault("_derived_markets", []).append(
+                            {"key": "asian_handicap", "outcomes": ah_outcomes}
+                        )
 
-                    selection = (selection
-                        .replace("Over", "Más de")
-                        .replace("Under", "Menos de"))
+                # Procesar outcomes del mercado actual + mercados derivados
+                all_markets_to_process = [(market_key, market)]
+                for dm in bookmaker.get("_derived_markets", []):
+                    all_markets_to_process.append((dm["key"], dm))
+                bookmaker["_derived_markets"] = []  # Limpiar después de recoger
 
-                    # Rango fijini: 1.10 a 1.30
-                    if 1.10 <= price <= 1.30:
-                        dict_key = f"{market_key}_{selection}"
-                        if dict_key not in best_odds_map or price > best_odds_map[dict_key]["price"]:
-                            best_odds_map[dict_key] = {
-                                "market": MARKET_LABELS.get(market_key, market_key),
-                                "market_key": market_key,
-                                "selection": selection,
-                                "price": price,
-                                "bookmaker": bookmaker_name
-                            }
+                for proc_key, proc_market in all_markets_to_process:
+                    for outcome in proc_market.get("outcomes", []):
+                        price = outcome["price"]
+                        selection = outcome["name"]
+
+                        if "point" in outcome:
+                            selection = f"{selection} {outcome['point']}"
+
+                        selection = (selection
+                            .replace("Over", "Más de")
+                            .replace("Under", "Menos de"))
+                        if FIJINI_PRICE_MIN <= price <= FIJINI_PRICE_MAX:
+                            dict_key = f"{proc_key}_{selection}"
+                            if dict_key not in best_odds_map or price > best_odds_map[dict_key]["price"]:
+                                best_odds_map[dict_key] = {
+                                    "market": MARKET_LABELS.get(proc_key, proc_key),
+                                    "market_key": proc_key,
+                                    "selection": selection,
+                                    "price": price,
+                                    "bookmaker": bookmaker_name
+                                }
 
         all_fijinis = list(best_odds_map.values())
 
@@ -129,8 +196,8 @@ def filter_fijinis(raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if all_safe:
                 all_fijinis = [min(all_safe, key=lambda x: x["price"])]
 
-        # Limitar a máximo 3, priorizando variedad de mercados
-        selected = _pick_best_varied(all_fijinis, max_count=3)
+        # Limitar a máximo FIJINI_MAX_PER_MATCH, priorizando variedad de mercados
+        selected = _pick_best_varied(all_fijinis, max_count=FIJINI_MAX_PER_MATCH)
 
         if selected:
             matches_result.append({
@@ -145,7 +212,7 @@ def filter_fijinis(raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return matches_result
 
 
-def _pick_best_varied(fijinis: List[Dict], max_count: int = 3) -> List[Dict]:
+def _pick_best_varied(fijinis: List[Dict], max_count: int = FIJINI_MAX_PER_MATCH) -> List[Dict]:
     """Selecciona hasta max_count fijinis asegurando variedad de mercados."""
     if not fijinis:
         return []
@@ -193,6 +260,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.22, "point": 2.5},
                 {"name": "Under", "price": 1.66, "point": 2.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.85},
+                {"name": "No", "price": 1.90},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.40, "point": 3.5},
+                {"name": "Under", "price": 2.80, "point": 3.5},
+            ]},
             {"key": "corners", "outcomes": [
                 {"name": "Over", "price": 1.19, "point": 9.5},
                 {"name": "Under", "price": 1.75, "point": 9.5},
@@ -212,6 +287,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Sí", "price": 1.80},
                 {"name": "No", "price": 1.95},
             ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.35, "point": 3.5},
+                {"name": "Under", "price": 3.00, "point": 3.5},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.30},
+                {"name": "Sin gol en la 1ª mitad", "price": 3.40},
+            ]},
         ]}]
     },
     # Grupo B
@@ -227,6 +310,10 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.28, "point": 1.5},
                 {"name": "Under", "price": 3.90, "point": 1.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.75},
+                {"name": "No", "price": 2.00},
             ]},
             {"key": "corners", "outcomes": [
                 {"name": "Over", "price": 1.16, "point": 8.5},
@@ -247,6 +334,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.14, "point": 2.5},
                 {"name": "Under", "price": 1.80, "point": 2.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 2.10},
+                {"name": "No", "price": 1.70},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.45, "point": 3.5},
+                {"name": "Under", "price": 2.60, "point": 3.5},
+            ]},
         ]}]
     },
     # Grupo C
@@ -262,6 +357,10 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.26, "point": 1.5},
                 {"name": "Under", "price": 3.60, "point": 1.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.70},
+                {"name": "No", "price": 2.10},
             ]},
             {"key": "corners", "outcomes": [
                 {"name": "Over", "price": 1.21, "point": 10.5},
@@ -281,6 +380,14 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.90, "point": 2.5},
                 {"name": "Under", "price": 1.90, "point": 2.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.85},
+                {"name": "No", "price": 1.90},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.50, "point": 4.5},
+                {"name": "Under", "price": 2.40, "point": 4.5},
             ]},
         ]}]
     },
@@ -302,6 +409,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.24, "point": 1.5},
                 {"name": "Under", "price": 4.00, "point": 1.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.80},
+                {"name": "No", "price": 1.95},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.25},
+                {"name": "Sin gol en la 1ª mitad", "price": 3.60},
+            ]},
         ]}]
     },
     {
@@ -316,6 +431,14 @@ WC2026_MATCHDAY1 = [
             {"key": "btts", "outcomes": [
                 {"name": "Sí", "price": 1.75},
                 {"name": "No", "price": 2.00},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.38, "point": 3.5},
+                {"name": "Under", "price": 2.90, "point": 3.5},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.28},
+                {"name": "Sin gol en la 1ª mitad", "price": 3.50},
             ]},
         ]}]
     },
@@ -337,6 +460,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.15, "point": 11.5},
                 {"name": "Under", "price": 5.50, "point": 11.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.45},
+                {"name": "No", "price": 2.60},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.55, "point": 4.5},
+                {"name": "Under", "price": 2.30, "point": 4.5},
+            ]},
         ]}]
     },
     {
@@ -351,6 +482,14 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.90, "point": 2.5},
                 {"name": "Under", "price": 1.90, "point": 2.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.80},
+                {"name": "No", "price": 1.95},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.32},
+                {"name": "Sin gol en la 1ª mitad", "price": 3.20},
             ]},
         ]}]
     },
@@ -372,6 +511,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.29, "point": 1.5},
                 {"name": "Under", "price": 3.50, "point": 1.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.90},
+                {"name": "No", "price": 1.85},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.42, "point": 3.5},
+                {"name": "Under", "price": 2.70, "point": 3.5},
+            ]},
         ]}]
     },
     {
@@ -386,6 +533,14 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.50, "point": 2.5},
                 {"name": "Under", "price": 2.40, "point": 2.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.88},
+                {"name": "No", "price": 1.88},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.35},
+                {"name": "Sin gol en la 1ª mitad", "price": 3.10},
             ]},
         ]}]
     },
@@ -407,6 +562,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.22, "point": 8.5},
                 {"name": "Under", "price": 1.65, "point": 8.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 2.00},
+                {"name": "No", "price": 1.78},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.48, "point": 3.5},
+                {"name": "Under", "price": 2.50, "point": 3.5},
+            ]},
         ]}]
     },
     {
@@ -426,6 +589,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.17, "point": 10.5},
                 {"name": "Under", "price": 5.20, "point": 10.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.72},
+                {"name": "No", "price": 2.05},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.22},
+                {"name": "Sin gol en la 1ª mitad", "price": 3.80},
+            ]},
         ]}]
     },
     # Grupo H
@@ -441,6 +612,14 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.80, "point": 2.5},
                 {"name": "Under", "price": 2.00, "point": 2.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.82},
+                {"name": "No", "price": 1.93},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.52, "point": 4.5},
+                {"name": "Under", "price": 2.35, "point": 4.5},
             ]},
         ]}]
     },
@@ -460,6 +639,14 @@ WC2026_MATCHDAY1 = [
             {"key": "corners", "outcomes": [
                 {"name": "Over", "price": 1.12, "point": 11.5},
                 {"name": "Under", "price": 6.00, "point": 11.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.60},
+                {"name": "No", "price": 2.25},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.35, "point": 3.5},
+                {"name": "Under", "price": 3.00, "point": 3.5},
             ]},
         ]}]
     },
@@ -481,6 +668,10 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.20, "point": 10.5},
                 {"name": "Under", "price": 1.72, "point": 10.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.68},
+                {"name": "No", "price": 2.12},
+            ]},
         ]}]
     },
     {
@@ -495,6 +686,18 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.50, "point": 2.5},
                 {"name": "Under", "price": 2.40, "point": 2.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.78},
+                {"name": "No", "price": 1.98},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.40, "point": 3.5},
+                {"name": "Under", "price": 2.80, "point": 3.5},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.38},
+                {"name": "Sin gol en la 1ª mitad", "price": 2.90},
             ]},
         ]}]
     },
@@ -516,6 +719,18 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.19, "point": 11.5},
                 {"name": "Under", "price": 4.80, "point": 11.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.55},
+                {"name": "No", "price": 2.35},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.30, "point": 3.5},
+                {"name": "Under", "price": 3.30, "point": 3.5},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.18},
+                {"name": "Sin gol en la 1ª mitad", "price": 4.20},
+            ]},
         ]}]
     },
     {
@@ -530,6 +745,14 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.23, "point": 1.5},
                 {"name": "Under", "price": 3.90, "point": 1.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.92},
+                {"name": "No", "price": 1.83},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.44, "point": 3.5},
+                {"name": "Under", "price": 2.65, "point": 3.5},
             ]},
         ]}]
     },
@@ -551,6 +774,14 @@ WC2026_MATCHDAY1 = [
                 {"name": "Over", "price": 1.14, "point": 10.5},
                 {"name": "Under", "price": 6.20, "point": 10.5},
             ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.58},
+                {"name": "No", "price": 2.30},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.20},
+                {"name": "Sin gol en la 1ª mitad", "price": 4.00},
+            ]},
         ]}]
     },
     {
@@ -565,6 +796,14 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.60, "point": 2.5},
                 {"name": "Under", "price": 2.20, "point": 2.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.75},
+                {"name": "No", "price": 2.00},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.46, "point": 3.5},
+                {"name": "Under", "price": 2.55, "point": 3.5},
             ]},
         ]}]
     },
@@ -581,6 +820,14 @@ WC2026_MATCHDAY1 = [
             {"key": "totals", "outcomes": [
                 {"name": "Over", "price": 1.80, "point": 2.5},
                 {"name": "Under", "price": 1.95, "point": 2.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.82},
+                {"name": "No", "price": 1.93},
+            ]},
+            {"key": "first_goal", "outcomes": [
+                {"name": "Gol en la 1ª mitad", "price": 1.40},
+                {"name": "Sin gol en la 1ª mitad", "price": 2.75},
             ]},
         ]}]
     },
@@ -600,6 +847,14 @@ WC2026_MATCHDAY1 = [
             {"key": "corners", "outcomes": [
                 {"name": "Over", "price": 1.18, "point": 9.5},
                 {"name": "Under", "price": 1.75, "point": 9.5},
+            ]},
+            {"key": "btts", "outcomes": [
+                {"name": "Sí", "price": 1.78},
+                {"name": "No", "price": 1.98},
+            ]},
+            {"key": "cards", "outcomes": [
+                {"name": "Over", "price": 1.36, "point": 3.5},
+                {"name": "Under", "price": 3.00, "point": 3.5},
             ]},
         ]}]
     },

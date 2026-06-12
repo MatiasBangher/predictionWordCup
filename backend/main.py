@@ -2,16 +2,23 @@ from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List
+import logging
 
 import models
 from database import engine, get_db
 from cache import cache
 from fetchers.odds_api import fetch_live_odds
-from fetchers.api_football import fetch_team_stats
+from fetchers.api_football import fetch_team_stats, get_team_stats_by_name
 from fetchers.api_football_odds import fetch_api_football_odds
+from fetchers.team_mapping import (
+    get_api_football_id, normalize_team_name,
+    get_matchday_fixtures, WC2026_FIXTURES
+)
 from analyzer import analyze_fijini
 from ml.advanced_wc_model import predict_match_probs
 from apscheduler.schedulers.background import BackgroundScheduler
+
+logger = logging.getLogger(__name__)
 
 # Create tables in SQLite
 models.Base.metadata.create_all(bind=engine)
@@ -47,11 +54,14 @@ def fetch_and_cache_odds_job():
     matches = list(matches_dict.values())
 
     for match in matches:
-        home_stats = fetch_team_stats(1 if match["home_team"] == "Argentina" else 2)
-        away_stats = fetch_team_stats(2)
+        home_name = normalize_team_name(match["home_team"])
+        away_name = normalize_team_name(match["away_team"])
+        
+        home_stats = get_team_stats_by_name(home_name)
+        away_stats = get_team_stats_by_name(away_name)
         
         for fijini in match.get("fijinis", []):
-            analysis = analyze_fijini(fijini, match["home_team"], match["away_team"], home_stats, away_stats)
+            analysis = analyze_fijini(fijini, home_name, away_name, home_stats, away_stats)
             fijini["analysis"] = analysis
             
     cache.set("live_odds", matches, ttl_seconds=300)
@@ -110,11 +120,14 @@ def get_live_odds(db: Session = Depends(get_db)):
     
     # 3. Analyze confidence score for each odd
     for match in matches:
-        home_stats = fetch_team_stats(1 if match["home_team"] == "Argentina" else 2)
-        away_stats = fetch_team_stats(2)
+        home_name = normalize_team_name(match["home_team"])
+        away_name = normalize_team_name(match["away_team"])
+        
+        home_stats = get_team_stats_by_name(home_name)
+        away_stats = get_team_stats_by_name(away_name)
         
         for fijini in match.get("fijinis", []):
-            analysis = analyze_fijini(fijini, match["home_team"], match["away_team"], home_stats, away_stats)
+            analysis = analyze_fijini(fijini, home_name, away_name, home_stats, away_stats)
             fijini["analysis"] = analysis
 
     # 4. Save to cache
@@ -193,25 +206,24 @@ def get_matchday_predictions(matchday: int = 1):
         predicted_winner = f["home_team"] if probs["home_win"] == highest_prob else (f["away_team"] if probs["away_win"] == highest_prob else "Empate")
         confidence = "Confianza Alta" if highest_prob >= 55 else "Confianza Media"
         
-        # Generación dinámica del análisis
-        if predicted_winner == f["home_team"]:
-            if highest_prob >= 60:
-                analysis_text = f"{f['home_team']} llega con un abrumador {highest_prob}% de probabilidad de victoria ante {f['away_team']}. Las métricas avanzadas (xG) muestran que {f['home_team']} genera muchas más ocasiones claras de gol. La jerarquía de su plantel debería dominar el encuentro en el {f['stadium']} sin problemas mayores."
+        # Generación dinámica del análisis con Groq
+        try:
+            from llm.groq_client import generate_match_preview
+            analysis_text = generate_match_preview(
+                home_team=f["home_team"],
+                away_team=f["away_team"],
+                group=f["group"],
+                stadium=f["stadium"],
+                probs=probs
+            )
+        except Exception:
+            # Fallback a texto genérico
+            if predicted_winner == f["home_team"]:
+                analysis_text = f"El modelo de Inteligencia Artificial se decanta por {f['home_team']} ({highest_prob}%)."
+            elif predicted_winner == f["away_team"]:
+                analysis_text = f"Leve ventaja para {f['away_team']} ({highest_prob}% de probabilidad)."
             else:
-                analysis_text = f"Partido trabado en el papel, pero el modelo de Inteligencia Artificial se decanta por {f['home_team']} ({highest_prob}%). {f['away_team']} tiene una defensa sólida, pero la localía y la presión alta podrían desequilibrar la balanza en la segunda mitad."
-        elif predicted_winner == f["away_team"]:
-            if highest_prob >= 60:
-                analysis_text = f"A pesar de no ser el local, la estadística es contundente: {f['away_team']} tiene un {highest_prob}% de llevarse los 3 puntos. Su mediocampo tiene un nivel élite y {f['home_team']} ha mostrado vulnerabilidades graves en los retrocesos defensivos recientemente."
-            else:
-                analysis_text = f"Leve ventaja para {f['away_team']} ({highest_prob}% de probabilidad). Será un partido cerrado en el {f['stadium']}, donde la diferencia de calidad individual de la plantilla visitante termina inclinando el porcentaje a su favor."
-        else:
-            analysis_text = f"Este choque del {f['group']} está para cualquiera. El modelo proyecta un altísimo {highest_prob}% de empate. Ambos equipos (tanto {f['home_team']} como {f['away_team']}) tienen un ELO similar y esquemas muy conservadores que priorizan no conceder goles."
-
-        # Toques específicos de equipos reales
-        if f["home_team"] == "Argentina":
-            analysis_text = "La vigente campeona del mundo inicia su camino. " + analysis_text
-        if f["home_team"] == "México":
-            analysis_text = "México abre ante su gente en un Estadio Azteca a reventar. " + analysis_text
+                analysis_text = f"Este choque del {f['group']} está para cualquiera. El modelo proyecta un altísimo {highest_prob}% de empate."
             
         f["probabilities"] = probs
         f["prediction"] = {
@@ -222,6 +234,136 @@ def get_matchday_predictions(matchday: int = 1):
         results.append(f)
         
     return {"data": results, "matchday": matchday}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NUEVO: Endpoint dinámico por Fecha con Monte Carlo por Apuesta
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/matchday/{matchday}/fijinis")
+def get_matchday_fijinis(matchday: int = 1):
+    """
+    Obtiene los fijinis de una fecha específica del Mundial con simulación
+    Monte Carlo individual para cada apuesta.
+    
+    - matchday=1: Fecha 1 (11-21 junio)
+    - matchday=2: Fecha 2 (22 junio - 2 julio)
+    - matchday=3: Fecha 3 (próximamente)
+    """
+    from ml.fijini_simulator import simulate_match_fijinis
+    
+    # 1. Obtener fixtures de la fecha
+    fixtures = get_matchday_fixtures(matchday)
+    if not fixtures:
+        return {"error": f"No hay fixtures para la Fecha {matchday}", "matchday": matchday}
+    
+    # 2. Obtener cuotas reales (o mock) para todos los partidos
+    all_odds = fetch_live_odds()
+    api_football_odds = fetch_api_football_odds(all_odds)
+    
+    # Crear mapa de cuotas por equipo para lookup rápido
+    odds_map = {}
+    for m in all_odds:
+        key = normalize_team_name(m.get("home_team", ""))
+        odds_map[key] = m
+    for m in api_football_odds:
+        key = normalize_team_name(m.get("home_team", ""))
+        if key in odds_map:
+            odds_map[key].setdefault("fijinis", []).extend(m.get("fijinis", []))
+        else:
+            odds_map[key] = m
+    
+    # 3. Para cada fixture, buscar cuotas y correr simulación
+    results = []
+    for fixture in fixtures:
+        home = fixture["home"]
+        away = fixture["away"]
+        
+        # Buscar cuotas del partido
+        match_odds = odds_map.get(home, {})
+        fijinis = match_odds.get("fijinis", [])
+        
+        # Stats de equipos
+        home_stats = get_team_stats_by_name(home)
+        away_stats = get_team_stats_by_name(away)
+        
+        # Predicción del modelo
+        probs = predict_match_probs(home, away)
+        
+        # Correr simulación Monte Carlo para todas las fijinis del partido
+        simulated_fijinis = []
+        if fijinis:
+            try:
+                sim_results = simulate_match_fijinis(
+                    home_team=home,
+                    away_team=away,
+                    fijinis=fijinis,
+                    n_simulations=10_000
+                )
+                simulated_fijinis = sim_results
+            except Exception as e:
+                logger.error(f"Error simulando fijinis para {home} vs {away}: {e}")
+                # Fallback: usar analyzer sin simulación
+                for fij in fijinis:
+                    analysis = analyze_fijini(fij, home, away, home_stats, away_stats)
+                    fij["analysis"] = analysis
+                    fij["simulation"] = {"error": str(e)}
+                simulated_fijinis = fijinis
+        
+        # Determinar predicción del partido
+        highest_prob = max(probs["home_win"], probs["draw"], probs["away_win"])
+        predicted_winner = home if probs["home_win"] == highest_prob else (away if probs["away_win"] == highest_prob else "Empate")
+        
+        results.append({
+            "home_team": home,
+            "away_team": away,
+            "group": f"Grupo {fixture['group']}",
+            "date": fixture["date"],
+            "stadium": fixture["stadium"],
+            "probabilities": probs,
+            "prediction": {
+                "winner": predicted_winner,
+                "confidence": "Alta" if highest_prob >= 55 else "Media",
+            },
+            "fijinis": simulated_fijinis,
+            "total_fijinis": len(simulated_fijinis),
+        })
+    
+    # Resumen general
+    total_fijinis = sum(r["total_fijinis"] for r in results)
+    green_bets = sum(
+        1 for r in results 
+        for f in r["fijinis"] 
+        if isinstance(f, dict) and f.get("simulation", {}).get("value_rating") == "GREEN"
+    )
+    
+    return {
+        "matchday": matchday,
+        "total_matches": len(results),
+        "total_fijinis": total_fijinis,
+        "green_value_bets": green_bets,
+        "data": results
+    }
+
+
+@app.get("/api/montecarlo-simulation")
+def get_montecarlo_simulation(n_simulations: int = 1000):
+    from ml.montecarlo_simulator import simulate_tournament
+    result = simulate_tournament(n_simulations=n_simulations)
+    return {"data": result}
+
+
+@app.get("/api/team/{team_name}/profile")
+def get_team_profile(team_name: str):
+    from ml.advanced_wc_model import load_team_ratings
+    try:
+        ratings = load_team_ratings()
+        team_rating = ratings.get(team_name)
+        if team_rating:
+            return {"data": team_rating}
+        return {"error": "Team not found"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # Simple WebSocket manager for streaming odds
